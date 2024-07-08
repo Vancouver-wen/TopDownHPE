@@ -15,6 +15,7 @@ from matplotlib import pyplot as plt
 
 from tools.instance_level_cost_matrix import get_instance_level_cost
 from tools.disjoint_set_cluster import DisjointSetCluster
+from tools.iterative_maximum_clique import IterativeMaximunCalique
 from tools.instance_level_triangulation import instance_level_clique_triangulate
 from tools.multi_show import show_multi_imgs
 
@@ -186,6 +187,8 @@ def main():
                 )
                 labels=DisjointSetCluster(eps=1e3,min_samples=3).fit_predict(cost_matrix)
                 print(f"=> DisjointSetCluster labels: {labels}")
+                labels=IterativeMaximunCalique(eps=1e3,min_samples=3).fit_predict(cost_matrix)
+                print(f"=> IterativeMaximunCalique labels: {labels}")
                 total_frame_cluster=vis_instances(
                     instances=instances,
                     labels=labels
@@ -206,7 +209,7 @@ def main():
                 # import pdb;pdb.set_trace()
                 height,width,channel=frame.shape
                 if out is None:
-                    out = cv2.VideoWriter('./test/test/vis_instance.mp4',cv2.VideoWriter_fourcc('H', '2', '6', '4'),25,(width,height))
+                    out = cv2.VideoWriter('./test/test/vis_instance_v2.mp4',cv2.VideoWriter_fourcc('H', '2', '6', '4'),25,(width,height))
                 out.write(frame)
                 pbar.update(1) 
     if out is not None:
