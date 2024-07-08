@@ -4,6 +4,8 @@ sys.path.append("./")
 import json
 from itertools import compress
 import gc
+from io import StringIO
+import io
 
 import cv2
 import numpy as np 
@@ -12,6 +14,8 @@ from natsort import natsorted
 from tqdm import tqdm
 from sklearn.cluster import DBSCAN,KMeans,MeanShift,AffinityPropagation
 from matplotlib import pyplot as plt
+from torch.utils.data import Dataset,DataLoader,SequentialSampler
+import PIL
 
 from tools.instance_level_cost_matrix import get_instance_level_cost
 from tools.disjoint_set_cluster import DisjointSetCluster
@@ -154,13 +158,68 @@ def vis_human_3ds(human_3ds):
         for joint_name in human_3d:
             joint_3d=human_3d[joint_name]
             ax.scatter3D(joint_3d[0],joint_3d[1],joint_3d[2],s=1,color='blue')
-    plt.savefig("./test/temp.jpg",dpi=1000)
+    #申请缓冲地址
+    buffer_ = io.BytesIO()#using buffer,great way!
+    #保存在内存中，而不是在本地磁盘，注意这个默认认为你要保存的就是plt中的内容
+    plt.savefig(buffer_,dpi=1000,format='jpg')
     ax.remove()
     fig.clear()
     plt.close(fig)
     del fig, ax
     gc.collect()
-    return cv2.imread("./test/temp.jpg")
+    buffer_.seek(0)
+    #用PIL或CV2从内存中读取
+    dataPIL = PIL.Image.open(buffer_)
+    #转换为nparrary，PIL转换就非常快了,data即为所需
+    data = np.asarray(dataPIL)
+    # cv2.imshow('image', data)
+    #释放缓存    
+    buffer_.close()
+    return data
+
+class MyDataset(Dataset):
+    def __init__(self,json_path,calibrations):
+        self.objs=[]
+        with jsonlines.open(json_path,'r') as reader:
+            for obj in reader:
+                self.objs.append(obj)
+        self.calibrations=calibrations
+    
+    def __getitem__(self, index):
+        obj=self.objs[index]
+        hpes=obj['hpe']
+        bboxes=obj['bbox'] # x1, y1, x2, y2, score, index
+        frames=obj['frame']
+        instances,cost_matrix=generate_hpe_cost_matrix(
+            frames=frames,
+            bboxes=bboxes,
+            poses=hpes,
+            calibrations=self.calibrations
+        )
+        # labels=DisjointSetCluster(eps=1e3,min_samples=3).fit_predict(cost_matrix)
+        # print(f"=> DisjointSetCluster labels: {labels}")
+        labels=IterativeMaximunCalique(eps=1e2,min_samples=3).fit_predict(cost_matrix)
+        print(f"=> IterativeMaximunCalique labels: {labels}")
+        total_frame_cluster=vis_instances(
+            instances=instances,
+            labels=labels
+        )
+        cliques=generate_clique(labels,instances)
+        human_3ds=[]
+        for key in cliques:
+            clique=cliques[key]
+            human_3d=instance_level_clique_triangulate(clique=clique)
+            human_3ds.append(human_3d)
+        scene_3d=vis_human_3ds(human_3ds)
+        ratio=total_frame_cluster.shape[0]/scene_3d.shape[0]
+        scene_3d=cv2.resize(scene_3d,dsize=None,fx=ratio,fy=ratio)
+        # import pdb;pdb.set_trace()
+        frame=np.hstack((total_frame_cluster,scene_3d))
+        frame=cv2.resize(frame,dsize=None,fx=0.5,fy=0.5)
+        return index,human_3ds,frame
+
+    def __len__(self):
+        return len(self.objs)
 
 def main():
     calibration_path="./snow51/cameras.json"
@@ -173,45 +232,29 @@ def main():
     json_path="./snow51/results.json"
     save_path="./snow51/human_3ds.json"
     out=None
-    with jsonlines.open(json_path,'r') as reader:
-        with jsonlines.open(save_path,'w') as writer:
-            for step,obj in enumerate(reader):
-                hpes=obj['hpe']
-                bboxes=obj['bbox'] # x1, y1, x2, y2, score, index
-                frames=obj['frame']
-                instances,cost_matrix=generate_hpe_cost_matrix(
-                    frames=frames,
-                    bboxes=bboxes,
-                    poses=hpes,
-                    calibrations=calibrations
-                )
-                labels=DisjointSetCluster(eps=1e3,min_samples=3).fit_predict(cost_matrix)
-                print(f"=> DisjointSetCluster labels: {labels}")
-                labels=IterativeMaximunCalique(eps=1e3,min_samples=3).fit_predict(cost_matrix)
-                print(f"=> IterativeMaximunCalique labels: {labels}")
-                total_frame_cluster=vis_instances(
-                    instances=instances,
-                    labels=labels
-                )
-                cliques=generate_clique(labels,instances)
-                human_3ds=[]
-                for key in cliques:
-                    clique=cliques[key]
-                    human_3d=instance_level_clique_triangulate(clique=clique)
-                    human_3ds.append(human_3d)
-                writer.write(human_3ds)
-                scene_3d=vis_human_3ds(human_3ds)
-                ratio=total_frame_cluster.shape[0]/scene_3d.shape[0]
-                scene_3d=cv2.resize(scene_3d,dsize=None,fx=ratio,fy=ratio)
-                frame=np.hstack((total_frame_cluster,scene_3d))
-                frame=cv2.resize(frame,dsize=None,fx=0.5,fy=0.5)
-                cv2.imwrite(f"./test/test/vis_instance.jpg",frame)
-                # import pdb;pdb.set_trace()
-                height,width,channel=frame.shape
-                if out is None:
-                    out = cv2.VideoWriter('./test/test/vis_instance_v2.mp4',cv2.VideoWriter_fourcc('H', '2', '6', '4'),25,(width,height))
-                out.write(frame)
-                pbar.update(1) 
+    myDataset=MyDataset(json_path,calibrations)
+    myDataloader=DataLoader(
+        dataset=myDataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=24,
+        collate_fn=lambda x:x
+    )
+    with jsonlines.open(save_path,'w') as writer:
+        for batch in myDataloader:
+            index,human_3ds,frame=batch[0]
+            print(f'=> index:{index}')
+            writer.write(human_3ds)
+            cv2.imwrite(f"./test/test/vis_instance_v3.jpg",frame)
+            # import pdb;pdb.set_trace()
+            height,width,channel=frame.shape
+            if out is None:
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                out = cv2.VideoWriter('./test/test/vis_instance_v3.avi',fourcc, 25.0,(width,height),True)
+                # out = cv2.VideoWriter('./test/test/vis_instance_v2.mp4',cv2.VideoWriter_fourcc('H', '2', '6', '4'),25,(width,height))
+                print("=> create video writer")
+            out.write(frame)
+            pbar.update(1) 
     if out is not None:
         out.release()
 if __name__=="__main__":
